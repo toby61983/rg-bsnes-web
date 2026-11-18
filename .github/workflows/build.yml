@@ -1,0 +1,131 @@
+# Retro Gauntlet: build the bsnes-jg emulator core for the web (WebAssembly), for PowerFest '94.
+#
+# Put this file in a GitHub repository at  .github/workflows/build.yml , then
+# Actions -> "Build bsnes-jg web core" -> Run workflow. When it finishes (about 20-40 minutes),
+# download the "bsnes-jg-web-core" artifact at the bottom of the run's page.
+#
+# It uses the same RetroArch version, Emscripten version and build scripts as the site's
+# existing N64 core (github.com/arianrhodsandlot/retroassembly-custom-cores), so the result
+# plugs into the site's emulator player the same way.
+# bsnes-jg: github.com/libretro/bsnes-jg (GPL-3.0).
+
+name: Build bsnes-jg web core
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Get the RetroArch web build kit (same versions as the site's other cores)
+        run: |
+          git clone https://github.com/arianrhodsandlot/retroassembly-custom-cores kit
+          cd kit
+          git log -1 --format='build kit commit %H (%cd)'
+          git submodule update --init modules/emsdk modules/retroarch
+
+      - name: Get bsnes-jg
+        run: |
+          git clone --depth 1 https://github.com/libretro/bsnes-jg kit/modules/cores/bsnes-jg
+          cd kit/modules/cores/bsnes-jg
+          git log -1 --format='bsnes-jg commit %H (%cd)'
+
+      - name: Give bsnes's coroutine library (libco) a WebAssembly backend
+        # bsnes runs each chip (CPU, sound, video...) as a coroutine. libco has no WebAssembly version,
+        # so this adds one built on Emscripten fibers (which is why the build below uses ASYNC=1).
+        run: |
+          cd kit/modules/cores/bsnes-jg/deps/libco
+          cat > emscripten.c <<'EOF'
+          /* libco backend for WebAssembly: Emscripten fibers (needs -sASYNCIFY). Added by Retro Gauntlet. */
+          #define LIBCO_C
+          #include "libco.h"
+          #include <stdlib.h>
+          #include <emscripten/fiber.h>
+
+          #define CO_ASYNCIFY_STACK (512 * 1024)
+          #define CO_MIN_STACK (512 * 1024)
+
+          typedef struct {
+            emscripten_fiber_t fiber;
+            void (*entry)(void);
+            void* c_stack;
+            void* asyncify_stack;
+          } co_fiber;
+
+          static co_fiber co_primary;
+          static co_fiber* co_running = 0;
+          static char co_primary_astack[CO_ASYNCIFY_STACK];
+
+          static void co_trampoline(void* arg) {
+            co_fiber* self = (co_fiber*)arg;
+            self->entry();
+            abort();  /* a cothread must never return */
+          }
+
+          cothread_t co_active(void) {
+            if(!co_running) {
+              emscripten_fiber_init_from_current_context(&co_primary.fiber, co_primary_astack, sizeof(co_primary_astack));
+              co_running = &co_primary;
+            }
+            return (cothread_t)co_running;
+          }
+
+          cothread_t co_derive(void* memory, unsigned int size, void (*entry)(void)) {
+            (void)memory; (void)size; (void)entry;
+            return 0;  /* not supported here; bsnes uses co_create */
+          }
+
+          cothread_t co_create(unsigned int size, void (*entry)(void)) {
+            co_fiber* c;
+            if(!co_running) co_active();
+            if(size < CO_MIN_STACK) size = CO_MIN_STACK;
+            c = (co_fiber*)calloc(1, sizeof(co_fiber));
+            if(!c) return 0;
+            c->entry = entry;
+            c->c_stack = malloc(size);
+            c->asyncify_stack = malloc(CO_ASYNCIFY_STACK);
+            if(!c->c_stack || !c->asyncify_stack) { free(c->c_stack); free(c->asyncify_stack); free(c); return 0; }
+            emscripten_fiber_init(&c->fiber, co_trampoline, c, c->c_stack, size, c->asyncify_stack, CO_ASYNCIFY_STACK);
+            return (cothread_t)c;
+          }
+
+          void co_delete(cothread_t handle) {
+            co_fiber* c = (co_fiber*)handle;
+            if(!c || c == &co_primary) return;
+            free(c->c_stack); free(c->asyncify_stack); free(c);
+          }
+
+          void co_switch(cothread_t handle) {
+            co_fiber* prev = co_running;
+            co_fiber* next = (co_fiber*)handle;
+            if(prev == next) return;
+            co_running = next;
+            emscripten_fiber_swap(&prev->fiber, &next->fiber);
+          }
+
+          int co_serializable(void) {
+            return 0;  /* fiber stacks can't be saved; bsnes then saves states at a synchronised point */
+          }
+          EOF
+          { printf '#if defined(__EMSCRIPTEN__)\n#include "emscripten.c"\n#else\n'; cat libco.c; printf '\n#endif\n'; } > libco.new
+          mv libco.new libco.c
+          head -5 libco.c
+
+      - name: Build (with the same async settings the kit uses for its N64 core)
+        run: |
+          cd kit
+          # bsnes-jg needs the kit's RetroArch patch and async build flags, like mupen64plus_next does
+          sed -i 's/    mupen64plus_next) echo "mupen64plus retroarch" ;;/    mupen64plus_next) echo "mupen64plus retroarch" ;;\n    bsnes-jg) echo "retroarch" ;;/' scripts/build-cores.sh
+          sed -i 's/if \[ "$core" = "mupen64plus_next" \]; then/if [ "$core" = "mupen64plus_next" ] || [ "$core" = "bsnes-jg" ]; then/' scripts/build-cores.sh
+          grep -n 'bsnes-jg' scripts/build-cores.sh
+          ./scripts/build-cores.sh bsnes-jg
+          ./scripts/archive.sh
+          ls -la dist/cores
+
+      - name: Save the result
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsnes-jg-web-core
+          path: kit/dist/cores/bsnes-jg_libretro.zip
+          if-no-files-found: error
